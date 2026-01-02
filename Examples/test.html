@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<head>
+<meta name="viewport" content="width=device-width">
+<title>Example HTML for WebAuthenticationSession</title>
+<style>
+html {
+    font-family: system-ui, sans-serif;
+}
+body {
+    max-width: 60ch;
+    font-size: 16px;
+}
+input, button {
+    font-size: 16px;
+}
+</style>
+</head>
+<body>
+<h1>WebAuthenticationSession Example</h1>
+<p>A proper login page would accept a user name and password, verify them with values in a database, and then redirect the user to the native app's custom URL scheme.</p>
+<p>This dummy login page accepts a <code>scheme</code> URL query parameter, lets you type in a token, and redirects the user to that scheme.</p>
+<div id="content"></div>
+<script>
+const url = new URL(window.location.href);
+const scheme = url.searchParams.get('scheme');
+if (!scheme) {
+    url.searchParams.append('scheme', 'asdf');
+    window.content.textContent = `Visit this page with a scheme URL query parameter, e.g. ${url.toString()}`;
+} else {
+    function h(tagName, attributes, ...children) {
+        const element = document.createElement(tagName);
+        for (const [name, value] of Object.entries(attributes ?? {})) {
+            element.setAttribute(name, value);
+        }
+        element.append(...children.filter(child => child != null));
+        return element;
+    }
+    window.content.append(
+        h('p', null, `This form will submit the token below to <${scheme}://auth?token=12345>`),
+        h('form', {action: `${scheme}://auth`},
+            h('input', {type: 'text', name: 'token', value: '12345'}),
+            h('button', null, 'Submit')
+        )
+    );
+}
+</script>
+</body>
