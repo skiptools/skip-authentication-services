@@ -29,7 +29,7 @@ if (!scheme) {
 } else {
     function h(tagName, attributes, ...children) {
         const element = document.createElement(tagName);
-        for (const [name, value] of Object.entries(attributes ?? {})) {
+        for (const [name, value] of Object.entries(attributes || {})) {
             element.setAttribute(name, value);
         }
         element.append(...children.filter(child => child != null));
