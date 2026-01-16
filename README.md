@@ -63,12 +63,7 @@ If you need to store the token securely, consider storing it in the user's keych
 > Be sure to test `WebAuthenticationSession` on the oldest version of Android that you support, as well as the latest version. Old versions of Android require additional "fallback" setup; see the previous section for details.
 
 ```swift
-#if os(Android)
 import SkipAuthenticationServices
-#else
-import AuthenticationServices
-#endif
-
 import SwiftUI
 
 struct ContentView: View {
