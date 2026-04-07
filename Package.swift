@@ -10,8 +10,8 @@ let package = Package(
         .library(name: "SkipAuthenticationServices", type: .dynamic, targets: ["SkipAuthenticationServices"]),
     ],
     dependencies: [
-        .package(url: "https://source.skip.tools/skip.git", from: "1.6.36"),
-        .package(url: "https://source.skip.tools/skip-ui.git", from: "1.46.0")
+        .package(url: "https://source.skip.tools/skip.git", from: "1.8.4"),
+        .package(url: "https://source.skip.tools/skip-ui.git", from: "1.51.0")
     ],
     targets: [
         .target(name: "SkipAuthenticationServices", dependencies: [
