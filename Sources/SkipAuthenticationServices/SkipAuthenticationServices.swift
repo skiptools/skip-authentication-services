@@ -222,4 +222,13 @@ struct CustomTabsIntentListener : Consumer<Intent> {
     }
 }
 #endif
+#else
+import SkipSwiftUI
+
+extension EnvironmentValues {
+    public var webAuthenticationSession: WebAuthenticationSession {
+        get { fatalError() }
+        set { fatalError() }
+    }
+}
 #endif
