@@ -231,4 +231,7 @@ extension EnvironmentValues {
         set { fatalError() }
     }
 }
+
+extension WebAuthenticationSession: @unchecked Sendable {}
+
 #endif
