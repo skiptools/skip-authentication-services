@@ -4,9 +4,12 @@
 #if SKIP
 import Foundation
 import SwiftUI
+import OSLog
 import androidx.browser.auth.AuthTabIntent
+import androidx.browser.customtabs.CustomTabsCallback
 import androidx.browser.customtabs.CustomTabsClient
 import androidx.browser.customtabs.CustomTabsIntent
+import androidx.browser.customtabs.CustomTabsServiceConnection
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.ActivityResultRegistry
@@ -14,11 +17,15 @@ import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import android.net.Uri
 import android.app.Activity
+import android.app.Application
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import androidx.core.util.Consumer
 import java.util.UUID
 import kotlinx.coroutines.suspendCancellableCoroutine
+
+let logger: Logger = Logger(subsystem: "skip.authentication-services", category: "SkipAuthenticationServices")
 
 struct WebAuthenticationSessionEnvironmentKey: EnvironmentKey {
     static let defaultValue = WebAuthenticationSession()
@@ -57,6 +64,13 @@ public struct ASWebAuthenticationSessionError: CustomNSError, Hashable, Error {
 
 // SKIP @bridge
 public struct WebAuthenticationSession {
+    private enum FallbackAuthState {
+        case readyToLaunch
+        case launched
+        case pausedAfterLaunch
+        case completed
+    }
+
     public enum BrowserSession {
         case ephemeral
         case shared
@@ -144,11 +158,25 @@ public struct WebAuthenticationSession {
             }
         } else {
             // Fallback to Custom Tabs
-            var listener: CustomTabsIntentListener? = nil
+
+            // Custom Tabs cancellation is observed through multiple signals:
+            // 1) A matching callback intent means authentication succeeded.
+            // 2) If we can bind a Custom Tabs session, TAB_HIDDEN means user dismissed the tab.
+            // 3) If we can't bind a session (e.g. because we don't have permission to query the
+            //  custom tabs service), returning to this activity after launching the tab without
+            //  receiving a callback intent is treated as cancel.
+            var intentListener: CustomTabsIntentListener? = nil
+            var lifecycleCallbacks: AuthenticationLifecycleCallbacks? = nil
+            var customTabsConnection: CustomTabsSessionConnection? = nil
             defer {
-                let listenerToRemove = listener
-                if let listenerToRemove = listenerToRemove {
+                if let lifecycleCallbacks {
+                    activity.application.unregisterActivityLifecycleCallbacks(lifecycleCallbacks)
+                }
+                if let listenerToRemove = intentListener {
                     activity.removeOnNewIntentListener(listenerToRemove)
+                }
+                if let connectionToUnbind = customTabsConnection {
+                    activity.unbindService(connectionToUnbind)
                 }
             }
             
@@ -182,30 +210,103 @@ public struct WebAuthenticationSession {
             assert(canHandleCallback, "Activity \(currentActivityName) does not have an intent filter matching callback URL scheme. Expected URL: \(testCallbackURL). Add an intent-filter to AndroidManifest.xml with the matching scheme.")
             
             return try await suspendCancellableCoroutine { continuation in
-                let createdListener = CustomTabsIntentListener { intent in
-                    if let dataString = intent.dataString, let callbackURL = URL(string: dataString) {
-                        // Check if the URL matches our callback
-                        switch callback {
-                        case .customScheme(let scheme):
-                            if callbackURL.scheme == scheme {
-                                continuation.resumeWith(kotlin.Result.success(callbackURL))
-                            }
-                        case .https(let redirectHost, let redirectPath):
-                            if callbackURL.scheme == "https",
-                               let host = callbackURL.host, host == redirectHost,
-                               callbackURL.path == redirectPath {
-                                continuation.resumeWith(kotlin.Result.success(callbackURL))
-                            }
+                var fallbackAuthState: FallbackAuthState = .readyToLaunch
+                
+                let resumeOnce: (kotlin.Result<URL>) -> Void = { result in
+                    guard fallbackAuthState != .completed else { return }
+                    fallbackAuthState = .completed
+                    continuation.resumeWith(result)
+                }
+                
+                lifecycleCallbacks = AuthenticationLifecycleCallbacks(
+                    onPaused: { pausedActivity in
+                        if pausedActivity == activity, fallbackAuthState == .launched {
+                            fallbackAuthState = .pausedAfterLaunch
                         }
+                    },
+                    onResumed: { resumedActivity in
+                        if resumedActivity == activity, fallbackAuthState == .pausedAfterLaunch {
+                            let error = ASWebAuthenticationSessionError(code: .canceledLogin)
+                            resumeOnce(kotlin.Result.failure(error))
+                        }
+                    }
+                )
+                activity.application.registerActivityLifecycleCallbacks(lifecycleCallbacks!)
+                
+                intentListener = CustomTabsIntentListener { intent in
+                    guard let dataString = intent.dataString, let callbackURL = URL(string: dataString) else {
+                        logger.warning("launchCustomTab: callback intent had no valid URL: \(String(describing: intent.dataString))")
+                        return
+                    }
+                    // Check if the URL matches our callback
+                    switch callback {
+                    case .customScheme(let scheme):
+                        if callbackURL.scheme == scheme {
+                            resumeOnce(kotlin.Result.success(callbackURL))
+                        }
+                    case .https(let redirectHost, let redirectPath):
+                        if callbackURL.scheme == "https",
+                           let host = callbackURL.host, host == redirectHost,
+                           callbackURL.path == redirectPath {
+                            resumeOnce(kotlin.Result.success(callbackURL))
+                        }
+                    default:
+                        logger.warning("launchCustomTab: unknown callback URL: \(callbackURL)")
+                        break
                     }
                 }
                 
-                listener = createdListener
-                activity.addOnNewIntentListener(createdListener)
+                activity.addOnNewIntentListener(intentListener!)
                 
-                let customTabsIntent = CustomTabsIntent.Builder().build()
-                customTabsIntent.intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                customTabsIntent.launchUrl(activity, androidUri)
+                func launchCustomTab(_ customTabsSession: androidx.browser.customtabs.CustomTabsSession? = nil) {
+                    guard fallbackAuthState == .readyToLaunch else { return }
+                    fallbackAuthState = .launched
+                    
+                    let customTabsIntent: CustomTabsIntent
+                    if let customTabsSession {
+                        customTabsIntent = CustomTabsIntent.Builder(customTabsSession).build()
+                    } else {
+                        logger.warning("launchCustomTab: no custom tabs session")
+                        customTabsIntent = CustomTabsIntent.Builder().build()
+                    }
+                    
+                    customTabsIntent.intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    customTabsIntent.launchUrl(activity, androidUri)
+                }
+                
+                guard let packageName else {
+                    logger.warning("launchCustomTab: no CustomTabsClient package found, launching without session")
+                    launchCustomTab()
+                    return
+                }
+
+                let navigationCallback = CustomTabsNavigationCallback { navigationEvent in
+                    if navigationEvent == CustomTabsCallback.TAB_HIDDEN {
+                        let error = ASWebAuthenticationSessionError(code: .canceledLogin)
+                        resumeOnce(kotlin.Result.failure(error))
+                    }
+                }
+                
+                let connection = CustomTabsSessionConnection(
+                    onConnected: { client in
+                        let customTabsSession = client.newSession(navigationCallback)
+                        launchCustomTab(customTabsSession)
+                    },
+                    onDisconnected: { _ in
+                        if fallbackAuthState == .readyToLaunch {
+                            logger.warning("launchCustomTab: custom tabs service disconnected, launching without session")
+                            launchCustomTab()
+                        }
+                    }
+                )
+                
+                customTabsConnection = connection
+                let didBindCustomTabsService = CustomTabsClient.bindCustomTabsService(activity, packageName, connection)
+                if !didBindCustomTabsService {
+                    logger.warning("launchCustomTab: failed to bind custom tabs service")
+                    customTabsConnection = nil
+                    launchCustomTab()
+                }
             }
         }
     }
@@ -215,11 +316,74 @@ struct CustomTabsIntentListener : Consumer<Intent> {
     let onCallback: (Intent) -> Void
     
     override func accept(value: Intent) {
-        android.util.Log.d("CustomTabsIntentListener", "accept: \(value)")
         if value.action == Intent.ACTION_VIEW {
             onCallback(value)
         }
     }
+}
+
+class CustomTabsNavigationCallback: CustomTabsCallback {
+    let onNavigation: (Int) -> Void
+    
+    init(onNavigation: @escaping (Int) -> Void) {
+        self.onNavigation = onNavigation
+    }
+    
+    override func onNavigationEvent(navigationEvent: Int, extras: android.os.Bundle?) {
+        onNavigation(navigationEvent)
+    }
+}
+
+class CustomTabsSessionConnection: CustomTabsServiceConnection {
+    let onConnected: (CustomTabsClient) -> Void
+    let onDisconnected: (ComponentName) -> Void
+    
+    init(
+        onConnected: @escaping (CustomTabsClient) -> Void,
+        onDisconnected: @escaping (ComponentName) -> Void
+    ) {
+        self.onConnected = onConnected
+        self.onDisconnected = onDisconnected
+    }
+    
+    override func onCustomTabsServiceConnected(name: ComponentName, client: CustomTabsClient) {
+        onConnected(client)
+    }
+    
+    override func onServiceDisconnected(name: ComponentName) {
+        onDisconnected(name)
+    }
+}
+
+class AuthenticationLifecycleCallbacks: Application.ActivityLifecycleCallbacks {
+    let onPaused: (Activity) -> Void
+    let onResumed: (Activity) -> Void
+    
+    init(
+        onPaused: @escaping (Activity) -> Void,
+        onResumed: @escaping (Activity) -> Void
+    ) {
+        self.onPaused = onPaused
+        self.onResumed = onResumed
+    }
+    
+    override func onActivityPaused(activity: Activity) {
+        onPaused(activity)
+    }
+    
+    override func onActivityResumed(activity: Activity) {
+        onResumed(activity)
+    }
+    
+    override func onActivityCreated(activity: Activity, savedInstanceState: android.os.Bundle?) {}
+    
+    override func onActivityStarted(activity: Activity) {}
+    
+    override func onActivityStopped(activity: Activity) {}
+    
+    override func onActivitySaveInstanceState(activity: Activity, outState: android.os.Bundle) {}
+    
+    override func onActivityDestroyed(activity: Activity) {}
 }
 #endif
 #endif
