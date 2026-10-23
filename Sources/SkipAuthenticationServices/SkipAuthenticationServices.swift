@@ -19,6 +19,7 @@ import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import android.net.Uri
 import android.app.Activity
+import android.os.Build
 import android.app.Application
 import android.content.ComponentName
 import android.content.Intent
@@ -121,7 +122,16 @@ public struct WebAuthenticationSession {
         if isAuthTabSupported {
             let builder = AuthTabIntent.Builder()
             if preferredBrowserSession == .ephemeral {
-                builder.setEphemeralBrowsingEnabled(true)
+                // Ephemeral Auth Tab browsing crashes Chrome on Android 8–9 (API 26–28); safe from API 29 onward.
+                // https://issuetracker.google.com/issues/517208672
+                let minSdkForEphemeralAuthTabBrowsing = 29
+                if Int(Build.VERSION.SDK_INT) >= minSdkForEphemeralAuthTabBrowsing {
+                    builder.setEphemeralBrowsingEnabled(true)
+                } else {
+                    logger.warning(
+                        "Ephemeral Auth Tab browsing is disabled on Android API \(Build.VERSION.SDK_INT) (requires API \(minSdkForEphemeralAuthTabBrowsing)+); Chrome may crash if enabled. Using a shared browser session."
+                    )
+                }
             }
             let authTabIntent = builder.build()
             
