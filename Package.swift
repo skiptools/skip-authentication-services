@@ -34,7 +34,6 @@ if bridgeMode {
     package.targets.forEach({ target in
         target.dependencies += [
             .product(name: "SkipFuseUI", package: "skip-fuse-ui"),
-            .product(name: "SkipSwiftUI", package: "skip-fuse-ui"),
         ]
     })
 }
